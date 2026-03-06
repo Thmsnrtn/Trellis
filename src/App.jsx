@@ -1,9 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Grid3x3, Sparkles, Settings } from "lucide-react";
 import { C, FN } from "./constants/theme";
 import { ALL_MODULES } from "./constants/modules";
-import { SEED_DATA } from "./constants/seed";
-import { usePersistedState } from "./hooks/usePersistedState";
+import { WorkspaceProvider, useWorkspace } from "./context/WorkspaceContext";
+import { ToastProvider } from "./components/ui/Toast";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { Onboarding } from "./modules/Onboarding";
 import { ModCommand } from "./modules/ModCommand";
 import { ModCompose } from "./modules/ModCompose";
@@ -20,21 +22,39 @@ const MODULE_RENDERERS = {
   intel: ModIntel,
 };
 
-export default function TrellisApp() {
+function TrellisShell() {
+  const { profile, setProfile, ready } = useWorkspace();
   const [activeTab, setActiveTab] = useState("command");
-  const [ready, setReady] = useState(false);
+  const [viewReady, setViewReady] = useState(false);
 
-  const [profile, setProfile, profileReady] = usePersistedState("tr-profile", null);
-  const [data, setData, dataReady] = usePersistedState("tr-data", SEED_DATA);
+  useEffect(() => { setTimeout(() => setViewReady(true), 100); }, []);
 
-  useEffect(() => { setTimeout(() => setReady(true), 100); }, []);
+  // Compute visible tabs
+  const visibleTabs = useMemo(() => {
+    if (!profile) return [];
+    const userModules = (profile.modules || ["command", "compose", "pipeline", "intel"]).filter((id) => ALL_MODULES[id]);
+    const extraMods = userModules.filter((id) => id !== "command").slice(0, 2);
+    return ["command", ...extraMods, "ask", "settings"];
+  }, [profile]);
 
-  const addActivity = useCallback((text) => {
-    const entry = { text, time: new Date().toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) };
-    setData((prev) => ({ ...(prev || SEED_DATA), activity: [entry, ...((prev || SEED_DATA).activity || []).slice(0, 49)] }));
-  }, [setData]);
+  // Fix: move tab validation to useEffect instead of render
+  useEffect(() => {
+    if (visibleTabs.length > 0 && !visibleTabs.includes(activeTab)) {
+      setActiveTab("command");
+    }
+  }, [visibleTabs, activeTab]);
 
-  if (!profileReady || !dataReady) {
+  // Keyboard shortcuts
+  useKeyboardShortcuts({
+    "mod+k": () => setActiveTab("command"),
+    "mod+l": () => setActiveTab("ask"),
+    "mod+j": () => setActiveTab("settings"),
+    "escape": () => {
+      if (activeTab === "settings") setActiveTab("command");
+    },
+  }, !!profile);
+
+  if (!ready) {
     return (
       <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FN }}>
         <Grid3x3 size={28} color={C.a} />
@@ -46,22 +66,13 @@ export default function TrellisApp() {
     return <Onboarding onComplete={(p) => setProfile(p)} />;
   }
 
-  const safeData = data || SEED_DATA;
-  const userModules = (profile.modules || ["command", "compose", "pipeline", "intel"]).filter((id) => ALL_MODULES[id]);
-  const extraMods = userModules.filter((id) => id !== "command").slice(0, 2);
-  const visibleTabs = ["command", ...extraMods, "ask", "settings"];
-
-  if (!visibleTabs.includes(activeTab)) {
-    setActiveTab("command");
-  }
-
   const askMode = activeTab === "ask";
 
   function renderTab(tabId) {
-    if (tabId === "settings") return <ModSettings profile={profile} setProfile={setProfile} />;
-    if (tabId === "ask") return <ModAsk profile={profile} data={safeData} setData={setData} addActivity={addActivity} setProfile={setProfile} />;
+    if (tabId === "settings") return <ModSettings />;
+    if (tabId === "ask") return <ModAsk />;
     const Renderer = MODULE_RENDERERS[tabId];
-    if (Renderer) return <Renderer profile={profile} data={safeData} setData={setData} addActivity={addActivity} />;
+    if (Renderer) return <Renderer />;
     return <ModPlaceholder moduleId={tabId} />;
   }
 
@@ -71,6 +82,7 @@ export default function TrellisApp() {
 
       <div style={{ position: "fixed", top: -200, right: -200, width: 600, height: 600, background: `radial-gradient(circle, ${C.aG} 0%, transparent 60%)`, pointerEvents: "none" }} />
 
+      {/* Header */}
       <div style={{ padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${C.b1}`, position: "sticky", top: 0, zIndex: 50, background: "rgba(11,11,13,0.92)", backdropFilter: "blur(24px)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
           <div style={{ width: 28, height: 28, borderRadius: 8, background: `linear-gradient(135deg, ${C.a}, #3D6B47)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -86,19 +98,23 @@ export default function TrellisApp() {
         </button>
       </div>
 
+      {/* Content */}
       <div style={{
         flex: 1,
         padding: askMode ? 0 : "18px 14px 110px",
         maxWidth: askMode ? "100%" : 660,
         width: "100%",
         margin: "0 auto",
-        opacity: ready ? 1 : 0,
-        transform: ready ? "translateY(0)" : "translateY(8px)",
+        opacity: viewReady ? 1 : 0,
+        transform: viewReady ? "translateY(0)" : "translateY(8px)",
         transition: "all 0.4s cubic-bezier(0.4, 0, 0.2, 1)",
       }}>
-        {renderTab(activeTab)}
+        <ErrorBoundary>
+          {renderTab(activeTab)}
+        </ErrorBoundary>
       </div>
 
+      {/* Tab bar */}
       <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: "4px 6px 20px", background: "rgba(11,11,13,0.94)", backdropFilter: "blur(24px)", borderTop: `1px solid ${C.b1}`, display: "flex", justifyContent: "center", gap: 1, zIndex: 50 }}>
         {visibleTabs.map((tabId) => {
           const isAsk = tabId === "ask";
@@ -127,5 +143,15 @@ export default function TrellisApp() {
         })}
       </div>
     </div>
+  );
+}
+
+export default function TrellisApp() {
+  return (
+    <WorkspaceProvider>
+      <ToastProvider>
+        <TrellisShell />
+      </ToastProvider>
+    </WorkspaceProvider>
   );
 }

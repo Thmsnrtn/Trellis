@@ -1,12 +1,16 @@
 import { ArrowRight, BarChart3, TrendingUp, Target } from "lucide-react";
 import { C } from "../constants/theme";
+import { useWorkspace } from "../context/WorkspaceContext";
+import { useToast } from "../components/ui/Toast";
 import { Card } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { Btn } from "../components/ui/Btn";
 import { Section } from "../components/ui/Section";
 import { KPICard } from "../components/ui/KPICard";
 
-export function ModPipeline({ data, setData, addActivity }) {
+export function ModPipeline() {
+  const { data, setData, addActivity } = useWorkspace();
+  const toast = useToast();
   const pipeline = data.pipeline || [];
   const total = pipeline.reduce((s, d) => s + d.value, 0);
   const weighted = pipeline.reduce((s, d) => s + (d.value * d.prob) / 100, 0);
@@ -21,7 +25,8 @@ export function ModPipeline({ data, setData, addActivity }) {
         if (d.id !== id) return d;
         const idx = stages.indexOf(d.stage);
         if (idx < stages.length - 1) {
-          addActivity(`${d.name} advanced`);
+          addActivity(`${d.name} advanced to ${stageLabels[stages[idx + 1]]}`);
+          toast(`${d.name} advanced to ${stageLabels[stages[idx + 1]]}`, "success");
           return { ...d, stage: stages[idx + 1], prob: Math.min(d.prob + 12, 95) };
         }
         return d;

@@ -1,17 +1,22 @@
+import { useState } from "react";
 import {
   Mail, Calendar, Globe, MessageCircle, BookOpen, Layers,
-  Database, Briefcase, CreditCard, CheckCircle, Trash2,
+  Database, Briefcase, CreditCard, CheckCircle, Trash2, Clock,
 } from "lucide-react";
 import { C } from "../constants/theme";
 import { ALL_MODULES } from "../constants/modules";
+import { useWorkspace } from "../context/WorkspaceContext";
 import { sSave } from "../utils/storage";
 import { Card } from "../components/ui/Card";
 import { Btn } from "../components/ui/Btn";
 import { Input } from "../components/ui/Input";
 import { TextArea } from "../components/ui/TextArea";
 import { Section } from "../components/ui/Section";
+import { ConfirmDialog } from "../components/ui/ConfirmDialog";
 
-export function ModSettings({ profile, setProfile }) {
+export function ModSettings() {
+  const { profile, setProfile, auditLog } = useWorkspace();
+  const [showConfirm, setShowConfirm] = useState(false);
   const activeModules = profile.modules || [];
 
   function toggleModule(id) {
@@ -24,6 +29,16 @@ export function ModSettings({ profile, setProfile }) {
 
   return (
     <div>
+      {showConfirm && (
+        <ConfirmDialog
+          title="Reset Everything"
+          message="This will permanently delete your profile, workspace data, chat history, and all customizations. This cannot be undone."
+          confirmText="DELETE"
+          onConfirm={async () => { await sSave("tr-profile", null); await sSave("tr-data", null); await sSave("tr-chat", null); await sSave("tr-audit", null); window.location.reload(); }}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+
       <Section title="Feature Library" sub="Add or remove tools from your workspace">
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {Object.values(ALL_MODULES).map((mod) => {
@@ -90,7 +105,24 @@ export function ModSettings({ profile, setProfile }) {
         </div>
       </Section>
 
-      <Btn small danger onClick={async () => { await sSave("tr-profile", null); await sSave("tr-data", null); await sSave("tr-chat", null); window.location.reload(); }}>
+      {/* Audit Trail */}
+      {auditLog.length > 0 && (
+        <Section title="Recent Changes" sub="Audit trail of workspace mutations">
+          <Card style={{ padding: 12, maxHeight: 200, overflowY: "auto" }}>
+            {auditLog.slice(0, 20).map((entry, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "4px 0", borderBottom: i < 19 ? `1px solid ${C.b1}` : "none" }}>
+                <Clock size={9} color={C.t3} style={{ marginTop: 3, flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 10, color: C.t2 }}>{entry.detail}</div>
+                  <div style={{ fontSize: 8, color: C.t3 }}>{entry.display} · {entry.source}</div>
+                </div>
+              </div>
+            ))}
+          </Card>
+        </Section>
+      )}
+
+      <Btn small danger onClick={() => setShowConfirm(true)}>
         <Trash2 size={10} /> Reset Everything
       </Btn>
     </div>

@@ -11,15 +11,29 @@ export async function callAI(messages, opts = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const msg = err.error?.message || `HTTP ${res.status}`;
+      console.error("AI API error:", msg);
+      return { error: true, message: msg };
+    }
+
     const data = await res.json();
-    return (data.content || [])
+    const text = (data.content || [])
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("\n") || "";
+    return text;
   } catch (e) {
     console.error("AI error:", e);
-    return "";
+    return { error: true, message: e.message || "Network error" };
   }
+}
+
+/** Check if a callAI result is an error */
+export function isAIError(result) {
+  return result && typeof result === "object" && result.error === true;
 }
 
 // ── Streaming Agentic Engine ──────────────────────────
@@ -52,7 +66,7 @@ export async function streamOneTurn(messages, opts = {}, onText, onToolSignal, s
 
   try {
     while (true) {
-      if (signal?.aborted) { reader.cancel(); break; }
+      if (signal?.aborted) { break; }
       const { done, value } = await reader.read();
       if (done) break;
       for (const line of decoder.decode(value, { stream: true }).split("\n")) {
@@ -100,17 +114,27 @@ export async function streamOneTurn(messages, opts = {}, onText, onToolSignal, s
   } catch (e) {
     if (e.name === "AbortError") { stopReason = "abort"; }
     else throw e;
+  } finally {
+    // Always release the reader to prevent memory leaks
+    try { reader.cancel(); } catch {}
   }
   return { content: contentBlocks, stopReason, text: textAccum };
 }
 
+// Agent configuration defaults
+const AGENT_DEFAULTS = {
+  maxIterations: 8,
+  thinkingBudget: 5000,
+};
+
 // Full agentic loop — streams text, executes local tools, loops until done
-// callbacks: { onText(turnText), onNewTurn(), onToolStart(name, input), onToolDone(name, result), onServerTool(name), executeTool(name, input) }
+// callbacks: { onText, onNewTurn, onToolStart, onToolDone, onServerTool, executeTool, onLimitReached }
 export async function runAgent(initialMessages, opts, callbacks, signal) {
+  const maxIterations = opts.maxIterations || AGENT_DEFAULTS.maxIterations;
   let messages = [...initialMessages];
   let iterations = 0;
 
-  while (iterations < 8) {
+  while (iterations < maxIterations) {
     if (signal?.aborted) break;
 
     // Signal new turn so UI creates a fresh text block
@@ -147,7 +171,7 @@ export async function runAgent(initialMessages, opts, callbacks, signal) {
       try {
         result = callbacks.executeTool(block.name, block.input);
       } catch (e) {
-        result = `Error: ${e.message}`;
+        result = JSON.stringify({ error: true, tool: block.name, message: e.message });
       }
       if (callbacks.onToolDone) callbacks.onToolDone(block.name, result);
       toolResults.push({ type: "tool_result", tool_use_id: block.id, content: typeof result === "string" ? result : JSON.stringify(result) });
@@ -155,5 +179,10 @@ export async function runAgent(initialMessages, opts, callbacks, signal) {
 
     messages.push({ role: "user", content: toolResults });
     iterations++;
+  }
+
+  // Warn if we hit the iteration limit
+  if (iterations >= maxIterations && callbacks.onLimitReached) {
+    callbacks.onLimitReached(iterations);
   }
 }

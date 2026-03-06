@@ -5,6 +5,8 @@ import {
   Plug, Loader, ChevronDown, Copy, RefreshCw, ArrowUpRight,
 } from "lucide-react";
 import { C, FN } from "../constants/theme";
+import { useWorkspace } from "../context/WorkspaceContext";
+import { useToast } from "../components/ui/Toast";
 import { usePersistedState } from "../hooks/usePersistedState";
 import { buildSystemPrompt } from "../ai/systemPrompt";
 import { runAgent } from "../ai/engine";
@@ -68,7 +70,9 @@ function ServerToolPill({ name }) {
   );
 }
 
-export function ModAsk({ profile, data, setData, addActivity, setProfile }) {
+export function ModAsk() {
+  const { profile, data, setData, dataRef, addActivity, setProfile, logMutation } = useWorkspace();
+  const toast = useToast();
   const systemPrompt = buildSystemPrompt(profile);
   const pipeline = data.pipeline || [];
   const leads = data.leads || [];
@@ -93,8 +97,6 @@ export function ModAsk({ profile, data, setData, addActivity, setProfile }) {
   const inputRef = useRef(null);
   const msgId = useRef(Date.now());
   const abortRef = useRef(null);
-  const dataRef = useRef(data);
-  dataRef.current = data;
 
   useEffect(() => {
     if (msgsReady && msgs.length === 0 && profile) {
@@ -212,7 +214,11 @@ export function ModAsk({ profile, data, setData, addActivity, setProfile }) {
             }));
           },
           executeTool: (name, toolInput) => {
+            logMutation("agent_tool", `${name}: ${JSON.stringify(toolInput).slice(0, 100)}`, "agent");
             return executeLocalTool(name, toolInput, dataRef.current, setData, addActivity, profile, setProfile);
+          },
+          onLimitReached: (iterations) => {
+            toast(`Agent stopped after ${iterations} iterations`, "info");
           },
         },
         controller.signal
@@ -220,6 +226,7 @@ export function ModAsk({ profile, data, setData, addActivity, setProfile }) {
     } catch (e) {
       if (e.name !== "AbortError") {
         console.error("Agent error:", e);
+        toast("Something went wrong — please try again", "error");
         setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, blocks: [...(m.blocks || []), { type: "text", text: "\n\nSomething went wrong — please try again." }] } : m));
       }
     }

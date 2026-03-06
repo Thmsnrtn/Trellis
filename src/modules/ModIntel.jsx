@@ -1,15 +1,19 @@
 import { useState } from "react";
 import { Search, Sparkles } from "lucide-react";
 import { C, FN } from "../constants/theme";
+import { useWorkspace } from "../context/WorkspaceContext";
+import { useToast } from "../components/ui/Toast";
 import { Card } from "../components/ui/Card";
 import { Btn } from "../components/ui/Btn";
 import { Input } from "../components/ui/Input";
 import { Section } from "../components/ui/Section";
-import { callAI } from "../ai/engine";
+import { callAI, isAIError } from "../ai/engine";
 import { buildSystemPrompt } from "../ai/systemPrompt";
 import { TOOL_WEB } from "../ai/config";
 
-export function ModIntel({ profile, addActivity }) {
+export function ModIntel() {
+  const { profile, addActivity } = useWorkspace();
+  const toast = useToast();
   const systemPrompt = buildSystemPrompt(profile);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -23,8 +27,13 @@ export function ModIntel({ profile, addActivity }) {
       [{ role: "user", content: `Research for ${profile.name} (${profile.role}):\n"${searchQuery}"\nActionable intelligence.` }],
       { system: systemPrompt, tools: [TOOL_WEB] }
     );
-    setResult(r);
-    addActivity(`Research: "${searchQuery}"`);
+    if (isAIError(r)) {
+      toast("Research failed — try again", "error");
+    } else {
+      setResult(r);
+      addActivity(`Research: "${searchQuery}"`);
+      toast("Research complete", "success");
+    }
     setLoading(false);
   }
 
