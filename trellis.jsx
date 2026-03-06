@@ -182,6 +182,64 @@ return "";
 }
 }
 
+// Streaming AI call — onProgress(accumulatedText, activeToolName | null)
+async function callAIStream(messages, opts = {}, onProgress) {
+try {
+const body = { model: "claude-sonnet-4-20250514", max_tokens: 2048, messages, stream: true };
+if (opts.system) body.system = opts.system;
+if (opts.tools) body.tools = opts.tools;
+if (opts.mcp) body.mcp_servers = opts.mcp;
+
+const res = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+if (!res.ok || !res.body) {
+  const err = await res.json().catch(() => ({}));
+  throw new Error(err.error?.message || `HTTP ${res.status}`);
+}
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let accumulated = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  const chunk = decoder.decode(value, { stream: true });
+  for (const line of chunk.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const raw = line.slice(6).trim();
+    if (!raw || raw === "[DONE]") continue;
+    try {
+      const evt = JSON.parse(raw);
+      if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
+        const n = evt.content_block.name || "";
+        const display = n.includes("search") ? "web"
+          : n.includes("gmail") || n.includes("mail") ? "gmail"
+          : n.includes("cal") ? "calendar"
+          : "tool";
+        onProgress(accumulated, display);
+      }
+      if (evt.type === "content_block_stop") {
+        onProgress(accumulated, null);
+      }
+      if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
+        accumulated += evt.delta.text;
+        onProgress(accumulated, null);
+      }
+    } catch {}
+  }
+}
+return accumulated;
+} catch (e) {
+console.error("Stream error:", e);
+throw e;
+}
+}
+
 function buildSystemPrompt(profile) {
 if (!profile) return "You are a helpful AI assistant.";
 const voiceBlock =
@@ -1149,113 +1207,230 @@ return (
 );
 }
 
-// ── AI Agent Panel ─────────────────────────────────────
-function AgentPanel({ open, onClose, profile, data, setProfile }) {
+// ── MODULE: Ask AI ─────────────────────────────────────
+function ModAsk({ profile, data, setProfile }) {
 const systemPrompt = buildSystemPrompt(profile);
+const pipeline = data.pipeline || [];
+const leads = data.leads || [];
+const hotLeads = leads.filter((l) => l.status === "hot");
+const pipeTotal = pipeline.reduce((s, d) => s + d.value, 0);
+
 const [msgs, setMsgs] = useState([]);
 const [input, setInput] = useState("");
-const [loading, setLoading] = useState(false);
+const [streaming, setStreaming] = useState(false);
+const [activeTool, setActiveTool] = useState(null);
 const scrollRef = useRef(null);
+const inputRef = useRef(null);
+const msgId = useRef(0);
 
 useEffect(() => {
 if (msgs.length === 0 && profile) {
-setMsgs([{ role: "assistant", text: `Hey ${profile.name}. I can draft emails, research anything, manage your calendar, and modify your workspace. What do you need?` }]);
+  const ctx = pipeline.length > 0
+    ? `$${(pipeTotal / 1000).toFixed(0)}K in pipeline, ${leads.length} leads${hotLeads.length > 0 ? ` (${hotLeads.length} hot)` : ""}, Gmail, Calendar, and the web`
+    : "your Gmail, Calendar, and the web";
+  setMsgs([{ role: "assistant", text: `Hey ${profile.name} — I'm connected to ${ctx}. What do you need?`, id: 0 }]);
 }
-}, [profile]);
+}, [profile?.name]);
 
 useEffect(() => {
 if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-}, [msgs]);
+}, [msgs, activeTool]);
 
-async function send() {
-if (!input.trim() || loading) return;
-const text = input.trim();
+const suggestions = [
+hotLeads.length > 0 && `Draft outreach to ${hotLeads[0].name}`,
+pipeline.length > 0 && "Summarize my pipeline",
+"What's on my calendar today?",
+`Research ${profile.industry || "my industry"} trends`,
+"Catch me up on my emails",
+].filter(Boolean).slice(0, 5);
+
+async function send(override) {
+const text = (override || input).trim();
+if (!text || streaming) return;
 setInput("");
-setLoading(true);
-setMsgs((prev) => [...prev, { role: "user", text }]);
+if (inputRef.current) { inputRef.current.style.height = "auto"; }
+setStreaming(true);
 
+const uid = ++msgId.current;
+const aid = ++msgId.current;
+setMsgs((prev) => [...prev, { role: "user", text, id: uid }, { role: "assistant", text: "", id: aid, live: true }]);
+
+// Handle workspace commands locally first
 const lower = text.toLowerCase();
-const addMatch = Object.entries(ALL_MODULES).find(([id, mod]) =>
-  lower.includes(`add ${mod.label.toLowerCase()}`) || lower.includes(`enable ${mod.label.toLowerCase()}`) || lower.includes(`i need ${mod.label.toLowerCase()}`) || lower.includes(`turn on ${mod.label.toLowerCase()}`)
+const addMatch = Object.entries(ALL_MODULES).find(([, mod]) =>
+  lower.includes(`add ${mod.label.toLowerCase()}`) || lower.includes(`enable ${mod.label.toLowerCase()}`) || lower.includes(`turn on ${mod.label.toLowerCase()}`)
 );
 if (addMatch) {
   const [id, mod] = addMatch;
-  const currentMods = profile.modules || [];
-  if (!currentMods.includes(id)) {
+  if (!(profile.modules || []).includes(id)) {
     setProfile((p) => ({ ...p, modules: [...(p.modules || []), id] }));
-    setMsgs((prev) => [...prev, { role: "assistant", text: `Done. I added ${mod.label} to your workspace. You should see it in your tab bar now. ${mod.desc}` }]);
-    setLoading(false);
+    setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, text: `Done — ${mod.label} is now in your workspace. ${mod.desc}`, live: false } : m));
+    setStreaming(false);
     return;
   }
 }
-
-const removeMatch = Object.entries(ALL_MODULES).find(([id, mod]) =>
-  lower.includes(`remove ${mod.label.toLowerCase()}`) || lower.includes(`hide ${mod.label.toLowerCase()}`) || lower.includes(`turn off ${mod.label.toLowerCase()}`)
+const removeMatch = Object.entries(ALL_MODULES).find(([, mod]) =>
+  lower.includes(`remove ${mod.label.toLowerCase()}`) || lower.includes(`turn off ${mod.label.toLowerCase()}`)
 );
 if (removeMatch && removeMatch[0] !== "command") {
   const [id, mod] = removeMatch;
   setProfile((p) => ({ ...p, modules: (p.modules || []).filter((m) => m !== id) }));
-  setMsgs((prev) => [...prev, { role: "assistant", text: `Removed ${mod.label} from your workspace. You can add it back anytime.` }]);
-  setLoading(false);
+  setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, text: `Removed ${mod.label} from your workspace. Add it back anytime from Settings.`, live: false } : m));
+  setStreaming(false);
   return;
 }
 
-const context = (data.pipeline || []).length > 0
-  ? `PIPELINE: ${data.pipeline.slice(0, 3).map((d) => `${d.name}: $${d.value}`).join("; ")}\nLEADS: ${(data.leads || []).filter((l) => l.status === "hot").slice(0, 3).map((l) => l.name).join(", ")}`
-  : "";
-const history = msgs.slice(-8).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
-const result = await callAI(
-  [...history, { role: "user", content: context ? `CONTEXT:\n${context}\n\nREQUEST: ${text}` : text }],
-  { system: systemPrompt, tools: [TOOL_WEB], mcp: [MCP_GCAL, MCP_GMAIL] }
-);
-setMsgs((prev) => [...prev, { role: "assistant", text: result || "Sorry, try again." }]);
-setLoading(false);
+const pipeCtx = pipeline.slice(0, 5).map((d) => `${d.name}: $${(d.value / 1000).toFixed(0)}K (${d.stage})`).join(", ");
+const leadCtx = hotLeads.slice(0, 4).map((l) => l.name).join(", ");
+const ctx = [pipeCtx && `Pipeline: ${pipeCtx}`, leadCtx && `Hot leads: ${leadCtx}`].filter(Boolean).join("\n");
+const history = msgs.filter((m) => m.text && !m.live).slice(-10).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
+
+try {
+  await callAIStream(
+    [...history, { role: "user", content: ctx ? `WORKSPACE:\n${ctx}\n\n${text}` : text }],
+    { system: systemPrompt, tools: [TOOL_WEB], mcp: [MCP_GCAL, MCP_GMAIL] },
+    (chunk, tool) => {
+      setActiveTool(tool);
+      setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, text: chunk } : m)));
+    }
+  );
+} catch {
+  setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, text: "Something went wrong — please try again." } : m)));
+}
+setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, live: false } : m)));
+setActiveTool(null);
+setStreaming(false);
 }
 
-if (!open) return null;
+const TOOL_META = {
+web:      { label: "Searching web",       Icon: Globe,     color: C.bl },
+gmail:    { label: "Reading Gmail",       Icon: Mail,      color: C.r  },
+calendar: { label: "Checking Calendar",   Icon: Calendar,  color: C.bl },
+tool:     { label: "Using tool",          Icon: Plug,      color: C.te },
+};
 
 return (
-<div style={{ position: "fixed", bottom: 76, right: 14, width: 380, maxHeight: "68vh", background: C.bg, borderRadius: 18, border: `1px solid ${C.b1}`, boxShadow: "0 24px 64px rgba(0,0,0,0.7), 0 0 40px rgba(107,158,120,0.04)", display: "flex", flexDirection: "column", overflow: "hidden", zIndex: 100 }}>
-<div style={{ padding: "12px 16px", borderBottom: `1px solid ${C.b1}`, display: "flex", alignItems: "center", justifyContent: "space-between", background: C.s1 }}>
-<div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-<div style={{ width: 30, height: 30, borderRadius: 9, background: C.aS, display: "flex", alignItems: "center", justifyContent: "center" }}><Sparkles size={15} color={C.a} /></div>
-<div><div style={{ fontSize: 13, fontWeight: 700, color: C.t1 }}>Trellis AI</div><div style={{ fontSize: 9, color: C.t3 }}>Email + Calendar + Web + Workspace</div></div>
-</div>
-<button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: C.t3, padding: 4 }}><X size={16} /></button>
-</div>
+<div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 110px)" }}>
 
-  <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-    {msgs.map((m, i) => (
-      <div key={i} style={{ alignSelf: m.role === "user" ? "flex-end" : "flex-start", maxWidth: "88%" }}>
-        <div style={{ padding: "10px 14px", borderRadius: 14, background: m.role === "user" ? C.a : C.s1, color: m.role === "user" ? "#fff" : C.t2, fontSize: 12, lineHeight: 1.65, whiteSpace: "pre-wrap", borderBottomRightRadius: m.role === "user" ? 3 : 14, borderBottomLeftRadius: m.role === "assistant" ? 3 : 14 }}>
-          {m.text}
-        </div>
+  {/* Connection status bar */}
+  <div style={{ padding: "7px 14px 6px", display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap", borderBottom: `1px solid ${C.b1}`, flexShrink: 0 }}>
+    {[
+      { label: "Gmail",    color: C.r,  Icon: Mail     },
+      { label: "Calendar", color: C.bl, Icon: Calendar },
+      { label: "Web",      color: C.te, Icon: Globe    },
+    ].map(({ label, color, Icon }) => (
+      <div key={label} style={{ display: "flex", alignItems: "center", gap: 3, padding: "2px 8px", borderRadius: 20, background: `${color}12`, border: `1px solid ${color}25` }}>
+        <div style={{ width: 5, height: 5, borderRadius: "50%", background: color }} />
+        <Icon size={9} color={color} />
+        <span style={{ fontSize: 9, color, fontWeight: 600 }}>{label}</span>
       </div>
     ))}
-    {loading && (
-      <div style={{ alignSelf: "flex-start", padding: "10px 14px", borderRadius: 14, background: C.s1 }}>
-        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-          {[0, 1, 2].map((i) => <div key={i} style={{ width: 5, height: 5, borderRadius: "50%", background: C.t3, animation: `pulse 1.2s ease ${i * 0.2}s infinite` }} />)}
-          <span style={{ fontSize: 10, color: C.t3, marginLeft: 4 }}>Working...</span>
-        </div>
+    {pipeline.length > 0 && (
+      <div style={{ marginLeft: "auto", padding: "2px 9px", borderRadius: 20, background: C.aS, border: `1px solid ${C.a}30` }}>
+        <span style={{ fontSize: 9, color: C.a, fontWeight: 600 }}>
+          {pipeline.length} deals · {leads.length} leads{hotLeads.length > 0 ? ` · ${hotLeads.length} hot` : ""}
+        </span>
       </div>
     )}
   </div>
 
-  <div style={{ padding: "6px 12px", borderTop: `1px solid ${C.b1}`, display: "flex", gap: 4, overflowX: "auto" }}>
-    {["Draft an email to my top lead", "What is on my calendar?", "Add Maps to my workspace", "Research my competitors"].map((q, i) => (
-      <button key={i} onClick={() => setInput(q)} style={{ padding: "4px 9px", borderRadius: 12, background: C.s2, border: `1px solid ${C.b1}`, color: C.t3, fontSize: 9, cursor: "pointer", fontFamily: FN, whiteSpace: "nowrap", flexShrink: 0 }}>{q}</button>
+  {/* Messages */}
+  <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
+    {msgs.map((m) => (
+      <div key={m.id} style={{ display: "flex", flexDirection: "column", alignItems: m.role === "user" ? "flex-end" : "flex-start" }}>
+        {m.role === "assistant" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5 }}>
+            <div style={{ width: 20, height: 20, borderRadius: 6, background: C.aS, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Sparkles size={10} color={C.a} />
+            </div>
+            <span style={{ fontSize: 10, color: C.t3, fontWeight: 600 }}>Trellis AI</span>
+          </div>
+        )}
+        <div style={{
+          maxWidth: m.role === "user" ? "78%" : "100%",
+          padding: m.role === "user" ? "10px 14px" : "12px 16px",
+          borderRadius: m.role === "user" ? "16px 16px 4px 16px" : "4px 16px 16px 16px",
+          background: m.role === "user" ? C.a : C.s1,
+          border: m.role === "assistant" ? `1px solid ${C.b1}` : "none",
+          color: m.role === "user" ? "#fff" : C.t2,
+          fontSize: 13, lineHeight: 1.72, whiteSpace: "pre-wrap",
+        }}>
+          {m.text || (m.live && !activeTool && (
+            <div style={{ display: "flex", gap: 4, alignItems: "center", padding: "2px 0" }}>
+              {[0, 1, 2].map((i) => (
+                <div key={i} style={{ width: 5, height: 5, borderRadius: "50%", background: C.t3, animation: `pulse 1.2s ease ${i * 0.2}s infinite` }} />
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
     ))}
+
+    {/* Live tool indicator */}
+    {activeTool && TOOL_META[activeTool] && (
+      <div style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 6, padding: "5px 11px", borderRadius: 20, background: `${TOOL_META[activeTool].color}12`, border: `1px solid ${TOOL_META[activeTool].color}25` }}>
+        <Loader size={10} color={TOOL_META[activeTool].color} style={{ animation: "spin 1s linear infinite" }} />
+        <span style={{ fontSize: 10, color: TOOL_META[activeTool].color, fontWeight: 600 }}>{TOOL_META[activeTool].label}...</span>
+      </div>
+    )}
   </div>
 
-  <div style={{ padding: "10px 12px", borderTop: `1px solid ${C.b1}`, display: "flex", gap: 8 }}>
-    <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()}
-      placeholder={`Ask anything, ${profile?.name || ""}...`}
-      style={{ flex: 1, padding: "11px 14px", borderRadius: 11, background: C.s1, border: `1px solid ${C.b1}`, color: C.t1, fontSize: 13, outline: "none", fontFamily: FN }} />
-    <button onClick={send} disabled={loading || !input.trim()}
-      style={{ width: 40, height: 40, borderRadius: 11, background: C.a, border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: loading || !input.trim() ? 0.4 : 1 }}>
-      <ArrowUpRight size={16} color="#fff" />
-    </button>
+  {/* Suggested prompts — shown only before conversation starts */}
+  {msgs.length <= 1 && (
+    <div style={{ padding: "6px 14px 4px", display: "flex", gap: 5, overflowX: "auto", flexShrink: 0 }}>
+      {suggestions.map((s, i) => (
+        <button key={i} onClick={() => send(s)} style={{
+          padding: "6px 12px", borderRadius: 20,
+          background: C.s1, border: `1px solid ${C.b1}`,
+          color: C.t2, fontSize: 10, cursor: "pointer",
+          fontFamily: FN, whiteSpace: "nowrap", flexShrink: 0,
+          transition: "background 0.15s",
+        }}>{s}</button>
+      ))}
+    </div>
+  )}
+
+  {/* Input */}
+  <div style={{ padding: "8px 14px 18px", borderTop: `1px solid ${C.b1}`, flexShrink: 0 }}>
+    <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+      <textarea
+        ref={inputRef}
+        value={input}
+        onChange={(e) => {
+          setInput(e.target.value);
+          e.target.style.height = "auto";
+          e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
+        }}
+        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+        placeholder="Ask anything… (Shift+Enter for new line)"
+        disabled={streaming}
+        rows={1}
+        style={{
+          flex: 1, padding: "11px 15px", borderRadius: 14,
+          background: C.s1, border: `1px solid ${C.b2}`,
+          color: C.t1, fontSize: 13, outline: "none",
+          fontFamily: FN, resize: "none", lineHeight: 1.5,
+          overflow: "hidden", opacity: streaming ? 0.6 : 1,
+          transition: "border-color 0.2s",
+        }}
+      />
+      <button
+        onClick={() => send()}
+        disabled={streaming || !input.trim()}
+        style={{
+          width: 42, height: 42, borderRadius: 12, flexShrink: 0,
+          background: streaming || !input.trim() ? C.s2 : C.a,
+          border: "none", cursor: streaming || !input.trim() ? "default" : "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          opacity: streaming || !input.trim() ? 0.4 : 1, transition: "all 0.2s",
+        }}
+      >
+        {streaming
+          ? <Loader size={15} color={C.t3} style={{ animation: "spin 1s linear infinite" }} />
+          : <ArrowUpRight size={16} color={!input.trim() ? C.t3 : "#fff"} />
+        }
+      </button>
+    </div>
   </div>
 </div>
 );
@@ -1293,7 +1468,6 @@ intel: ModIntel,
 export default function TrellisApp() {
 const [activeTab, setActiveTab] = useState("command");
 const [ready, setReady] = useState(false);
-const [agentOpen, setAgentOpen] = useState(false);
 
 const [profile, setProfile, profileReady] = usePersistedState("tr-profile", null);
 const [data, setData, dataReady] = usePersistedState("tr-data", SEED_DATA);
@@ -1320,14 +1494,19 @@ return <Onboarding onComplete={(p) => setProfile(p)} />;
 
 const safeData = data || SEED_DATA;
 const userModules = (profile.modules || ["command", "compose", "pipeline", "intel"]).filter((id) => ALL_MODULES[id]);
-const visibleTabs = ["command", ...userModules.filter((id) => id !== "command").slice(0, 4), "settings"];
+// "ask" is always pinned; modules get up to 2 slots between command and ask
+const extraMods = userModules.filter((id) => id !== "command").slice(0, 2);
+const visibleTabs = ["command", ...extraMods, "ask", "settings"];
 
 if (!visibleTabs.includes(activeTab)) {
 setActiveTab("command");
 }
 
+const askMode = activeTab === "ask";
+
 function renderTab(tabId) {
 if (tabId === "settings") return <ModSettings profile={profile} setProfile={setProfile} />;
+if (tabId === "ask") return <ModAsk profile={profile} data={safeData} setProfile={setProfile} />;
 const Renderer = MODULE_RENDERERS[tabId];
 if (Renderer) return <Renderer profile={profile} data={safeData} setData={setData} addActivity={addActivity} />;
 return <ModPlaceholder moduleId={tabId} />;
@@ -1354,27 +1533,42 @@ return (
     </button>
   </div>
 
-  <div style={{ flex: 1, padding: "18px 14px 110px", maxWidth: 660, width: "100%", margin: "0 auto", opacity: ready ? 1 : 0, transform: ready ? "translateY(0)" : "translateY(8px)", transition: "all 0.4s cubic-bezier(0.4, 0, 0.2, 1)" }}>
+  <div style={{
+    flex: 1,
+    padding: askMode ? 0 : "18px 14px 110px",
+    maxWidth: askMode ? "100%" : 660,
+    width: "100%",
+    margin: "0 auto",
+    opacity: ready ? 1 : 0,
+    transform: ready ? "translateY(0)" : "translateY(8px)",
+    transition: "all 0.4s cubic-bezier(0.4, 0, 0.2, 1)",
+  }}>
     {renderTab(activeTab)}
   </div>
 
-  <AgentPanel open={agentOpen} onClose={() => setAgentOpen(false)} profile={profile} data={safeData} setProfile={setProfile} />
-
-  <button onClick={() => setAgentOpen(!agentOpen)}
-    style={{ position: "fixed", bottom: 78, right: 14, width: 46, height: 46, borderRadius: 14, background: agentOpen ? C.s1 : `linear-gradient(135deg, ${C.a}, #3D6B47)`, border: agentOpen ? `1px solid ${C.b1}` : "none", boxShadow: agentOpen ? "none" : `0 4px 20px ${C.aG}`, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 99 }}>
-    {agentOpen ? <X size={17} color={C.t2} /> : <Sparkles size={18} color="#fff" />}
-  </button>
-
   <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: "4px 6px 20px", background: "rgba(11,11,13,0.94)", backdropFilter: "blur(24px)", borderTop: `1px solid ${C.b1}`, display: "flex", justifyContent: "center", gap: 1, zIndex: 50 }}>
     {visibleTabs.map((tabId) => {
-      const mod = tabId === "settings" ? { label: "Settings", Icon: Settings } : ALL_MODULES[tabId];
+      const isAsk = tabId === "ask";
+      const mod = tabId === "settings"
+        ? { label: "Settings", Icon: Settings }
+        : isAsk
+        ? { label: "Ask AI", Icon: Sparkles }
+        : ALL_MODULES[tabId];
       if (!mod) return null;
       const isActive = activeTab === tabId;
       return (
         <button key={tabId} onClick={() => setActiveTab(tabId)}
-          style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "5px 10px", borderRadius: 10, background: isActive ? C.aS : "transparent", border: "none", cursor: "pointer", minWidth: 46, fontFamily: FN }}>
-          <mod.Icon size={16} color={isActive ? C.a : C.t3} strokeWidth={isActive ? 2.2 : 1.5} />
-          <span style={{ fontSize: 8, fontWeight: isActive ? 700 : 500, color: isActive ? C.a : C.t3 }}>{mod.label}</span>
+          style={{
+            display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+            padding: isAsk ? "5px 18px" : "5px 10px",
+            borderRadius: 10,
+            background: isActive ? C.aS : isAsk ? `${C.a}18` : "transparent",
+            border: isAsk ? `1px solid ${C.a}35` : "none",
+            cursor: "pointer", minWidth: isAsk ? 62 : 46, fontFamily: FN,
+            transition: "all 0.2s",
+          }}>
+          <mod.Icon size={isAsk ? 17 : 16} color={isActive || isAsk ? C.a : C.t3} strokeWidth={isActive ? 2.2 : isAsk ? 2 : 1.5} />
+          <span style={{ fontSize: 8, fontWeight: isActive ? 700 : isAsk ? 600 : 500, color: isActive || isAsk ? C.a : C.t3 }}>{mod.label}</span>
         </button>
       );
     })}
