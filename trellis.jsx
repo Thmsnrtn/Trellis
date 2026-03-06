@@ -159,6 +159,181 @@ const MCP_GMAIL = { type: "url", url: "https://gmail.mcp.claude.com/mcp", name: 
 const MCP_GCAL = { type: "url", url: "https://gcal.mcp.claude.com/mcp", name: "gcal" };
 const TOOL_WEB = { type: "web_search_20250305", name: "web_search" };
 
+// ── Local Agent Tools ─────────────────────────────────
+const LOCAL_TOOLS = [
+{
+name: "search_workspace",
+description: "Search the user's workspace data. Use this FIRST to find lead IDs, deal IDs, or specific data before modifying anything.",
+input_schema: {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "Search term — matches names, sources, stages, details, status" },
+    type: { type: "string", enum: ["leads", "pipeline", "activity", "all"], description: "What to search. Default: all" },
+  },
+  required: ["query"],
+},
+},
+{
+name: "update_lead",
+description: "Update a lead's status, score, or details. Use after researching or interacting with a lead.",
+input_schema: {
+  type: "object",
+  properties: {
+    lead_id: { type: "string", description: "Lead ID (e.g. 'l1')" },
+    status: { type: "string", enum: ["hot", "warm", "cold"], description: "New status" },
+    score: { type: "number", description: "New score 0-100" },
+    detail: { type: "string", description: "Updated notes/details" },
+  },
+  required: ["lead_id"],
+},
+},
+{
+name: "update_deal",
+description: "Update a pipeline deal — advance stage, change probability, or modify value.",
+input_schema: {
+  type: "object",
+  properties: {
+    deal_id: { type: "string", description: "Deal ID (e.g. 'p1')" },
+    stage: { type: "string", enum: ["lead", "outreach", "meeting", "tour", "proposal", "negotiation", "contract", "closed"], description: "New stage" },
+    prob: { type: "number", description: "New probability 0-100" },
+    value: { type: "number", description: "New value in dollars" },
+  },
+  required: ["deal_id"],
+},
+},
+{
+name: "add_lead",
+description: "Create a new lead in the workspace from research or discovery.",
+input_schema: {
+  type: "object",
+  properties: {
+    name: { type: "string" }, source: { type: "string" }, detail: { type: "string" },
+    score: { type: "number", description: "Initial score 0-100" },
+    status: { type: "string", enum: ["hot", "warm", "cold"] },
+    revenue: { type: "number" }, email: { type: "string" },
+  },
+  required: ["name", "source", "detail"],
+},
+},
+{
+name: "add_deal",
+description: "Add a new deal to the pipeline when a lead becomes a concrete opportunity.",
+input_schema: {
+  type: "object",
+  properties: {
+    name: { type: "string" }, value: { type: "number" },
+    stage: { type: "string", enum: ["lead", "outreach", "meeting", "tour", "proposal", "negotiation", "contract", "closed"] },
+    prob: { type: "number" }, date: { type: "string" },
+  },
+  required: ["name", "value", "stage"],
+},
+},
+{
+name: "log_activity",
+description: "Record an action in the activity feed. Use after completing any significant action.",
+input_schema: {
+  type: "object",
+  properties: { text: { type: "string", description: "What happened" } },
+  required: ["text"],
+},
+},
+{
+name: "modify_workspace",
+description: "Enable or disable a module in the user's workspace.",
+input_schema: {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["add", "remove"] },
+    module_id: { type: "string", description: "Module ID", enum: Object.keys(ALL_MODULES) },
+  },
+  required: ["action", "module_id"],
+},
+},
+];
+
+function executeLocalTool(name, input, data, setData, addActivity, profile, setProfile) {
+switch (name) {
+case "search_workspace": {
+  const q = (input.query || "").toLowerCase();
+  const t = input.type || "all";
+  const res = {};
+  if (t === "all" || t === "leads") {
+    res.leads = (data.leads || []).filter((l) =>
+      l.name.toLowerCase().includes(q) || l.source.toLowerCase().includes(q) ||
+      (l.detail || "").toLowerCase().includes(q) || l.status.includes(q) || l.id.includes(q)
+    );
+  }
+  if (t === "all" || t === "pipeline") {
+    res.pipeline = (data.pipeline || []).filter((d) =>
+      d.name.toLowerCase().includes(q) || d.stage.includes(q) || d.id.includes(q)
+    );
+  }
+  if (t === "all" || t === "activity") {
+    res.activity = (data.activity || []).filter((a) => a.text.toLowerCase().includes(q)).slice(0, 10);
+  }
+  return JSON.stringify(res, null, 2);
+}
+case "update_lead": {
+  const { lead_id, ...updates } = input;
+  let found = null;
+  setData((prev) => ({
+    ...prev,
+    leads: (prev.leads || []).map((l) => {
+      if (l.id === lead_id) { found = { ...l, ...updates }; return found; }
+      return l;
+    }),
+  }));
+  return found ? `Updated lead "${found.name}": ${JSON.stringify(updates)}` : `Lead ${lead_id} not found.`;
+}
+case "update_deal": {
+  const { deal_id, ...updates } = input;
+  let found = null;
+  setData((prev) => ({
+    ...prev,
+    pipeline: (prev.pipeline || []).map((d) => {
+      if (d.id === deal_id) { found = { ...d, ...updates }; return found; }
+      return d;
+    }),
+  }));
+  if (found) addActivity(`Deal updated: ${found.name}`);
+  return found ? `Updated deal "${found.name}": ${JSON.stringify(updates)}` : `Deal ${deal_id} not found.`;
+}
+case "add_lead": {
+  const id = `l${Date.now()}`;
+  const lead = { id, name: input.name, source: input.source, detail: input.detail, score: input.score || 50, status: input.status || "warm", revenue: input.revenue || 0, email: input.email || "" };
+  setData((prev) => ({ ...prev, leads: [...(prev.leads || []), lead] }));
+  addActivity(`New lead: ${lead.name}`);
+  return `Created lead "${lead.name}" (ID: ${id}, source: ${lead.source})`;
+}
+case "add_deal": {
+  const id = `p${Date.now()}`;
+  const deal = { id, name: input.name, value: input.value, stage: input.stage, prob: input.prob || 30, date: input.date || "TBD" };
+  setData((prev) => ({ ...prev, pipeline: [...(prev.pipeline || []), deal] }));
+  addActivity(`New deal: ${deal.name} ($${deal.value})`);
+  return `Created deal "${deal.name}" ($${deal.value}, ${deal.stage}, ID: ${id})`;
+}
+case "log_activity": {
+  addActivity(input.text);
+  return `Logged activity: "${input.text}"`;
+}
+case "modify_workspace": {
+  const { action, module_id } = input;
+  const mod = ALL_MODULES[module_id];
+  if (!mod) return `Unknown module: ${module_id}`;
+  if (action === "add") {
+    setProfile((p) => ({ ...p, modules: [...new Set([...(p.modules || []), module_id])] }));
+    return `Added "${mod.label}" to workspace.`;
+  } else {
+    if (module_id === "command") return "Cannot remove the Command module.";
+    setProfile((p) => ({ ...p, modules: (p.modules || []).filter((m) => m !== module_id) }));
+    return `Removed "${mod.label}" from workspace.`;
+  }
+}
+default:
+  return `Unknown tool: ${name}`;
+}
+}
+
 async function callAI(messages, opts = {}) {
 try {
 const body = { model: "claude-sonnet-4-20250514", max_tokens: 1024, messages };
@@ -182,62 +357,118 @@ return "";
 }
 }
 
-// Streaming AI call — onProgress(accumulatedText, activeToolName | null)
-async function callAIStream(messages, opts = {}, onProgress) {
-try {
-const body = { model: "claude-sonnet-4-20250514", max_tokens: 2048, messages, stream: true };
+// ── Streaming Agentic Engine ──────────────────────────
+// Streams one API turn, returns { content: [...blocks], stopReason, text }
+async function streamOneTurn(messages, opts = {}, onText, onToolSignal) {
+const body = { model: "claude-sonnet-4-20250514", max_tokens: 4096, messages, stream: true };
 if (opts.system) body.system = opts.system;
 if (opts.tools) body.tools = opts.tools;
 if (opts.mcp) body.mcp_servers = opts.mcp;
+if (opts.thinking) body.thinking = opts.thinking;
 
 const res = await fetch("https://api.anthropic.com/v1/messages", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(body),
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify(body),
 });
 
 if (!res.ok || !res.body) {
-  const err = await res.json().catch(() => ({}));
-  throw new Error(err.error?.message || `HTTP ${res.status}`);
+const err = await res.json().catch(() => ({}));
+throw new Error(err.error?.message || `HTTP ${res.status}`);
 }
 
 const reader = res.body.getReader();
 const decoder = new TextDecoder();
-let accumulated = "";
+const contentBlocks = [];
+let idx = -1, curType = null, jsonBuf = "", textAccum = "", stopReason = "end_turn";
 
 while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  const chunk = decoder.decode(value, { stream: true });
-  for (const line of chunk.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const raw = line.slice(6).trim();
-    if (!raw || raw === "[DONE]") continue;
-    try {
-      const evt = JSON.parse(raw);
-      if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
-        const n = evt.content_block.name || "";
-        const display = n.includes("search") ? "web"
-          : n.includes("gmail") || n.includes("mail") ? "gmail"
-          : n.includes("cal") ? "calendar"
-          : "tool";
-        onProgress(accumulated, display);
+const { done, value } = await reader.read();
+if (done) break;
+for (const line of decoder.decode(value, { stream: true }).split("\n")) {
+  if (!line.startsWith("data: ")) continue;
+  const raw = line.slice(6).trim();
+  if (!raw || raw === "[DONE]") continue;
+  try {
+    const e = JSON.parse(raw);
+    if (e.type === "content_block_start") {
+      idx++;
+      const b = e.content_block;
+      curType = b.type;
+      if (b.type === "text") contentBlocks.push({ type: "text", text: "" });
+      else if (b.type === "tool_use") {
+        contentBlocks.push({ type: "tool_use", id: b.id, name: b.name, input: {} });
+        jsonBuf = "";
+        if (onToolSignal) onToolSignal(b.name, "start");
       }
-      if (evt.type === "content_block_stop") {
-        onProgress(accumulated, null);
+      else if (b.type === "thinking") contentBlocks.push({ type: "thinking", thinking: "" });
+    }
+    if (e.type === "content_block_delta") {
+      if (e.delta.type === "text_delta") {
+        textAccum += e.delta.text;
+        contentBlocks[idx].text += e.delta.text;
+        if (onText) onText(textAccum);
+      } else if (e.delta.type === "input_json_delta") {
+        jsonBuf += e.delta.partial_json;
+      } else if (e.delta.type === "thinking_delta") {
+        contentBlocks[idx].thinking += e.delta.thinking;
       }
-      if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
-        accumulated += evt.delta.text;
-        onProgress(accumulated, null);
+    }
+    if (e.type === "content_block_stop") {
+      if (curType === "tool_use" && jsonBuf) {
+        try { contentBlocks[idx].input = JSON.parse(jsonBuf); } catch {}
       }
-    } catch {}
+      if (curType === "tool_use" && onToolSignal) onToolSignal(contentBlocks[idx].name, "done");
+      curType = null;
+    }
+    if (e.type === "message_delta") {
+      stopReason = e.delta?.stop_reason || stopReason;
+    }
+  } catch {}
+}
+}
+return { content: contentBlocks, stopReason, text: textAccum };
+}
+
+// Full agentic loop — streams text, executes local tools, loops until done
+async function runAgent(initialMessages, opts, callbacks) {
+// callbacks: { onText(accum), onToolStart(name, input), onToolDone(name, result), onServerTool(name), onError(err) }
+let messages = [...initialMessages];
+let fullText = "";
+let iterations = 0;
+
+while (iterations < 8) {
+const turn = await streamOneTurn(
+  messages, opts,
+  (text) => { fullText = text; if (callbacks.onText) callbacks.onText(text); },
+  (toolName, phase) => {
+    if (phase === "start") {
+      // Check if it's a server-side tool (MCP/web) vs local
+      const isServer = toolName === "web_search" || toolName.includes("gmail") || toolName.includes("gcal") || toolName.includes("calendar");
+      if (isServer && callbacks.onServerTool) callbacks.onServerTool(toolName);
+    }
   }
+);
+
+messages.push({ role: "assistant", content: turn.content });
+
+if (turn.stopReason !== "tool_use") break;
+
+// Execute local tools
+const toolUseBlocks = turn.content.filter((b) => b.type === "tool_use");
+const toolResults = [];
+
+for (const block of toolUseBlocks) {
+  if (callbacks.onToolStart) callbacks.onToolStart(block.name, block.input);
+  const result = callbacks.executeTool(block.name, block.input);
+  if (callbacks.onToolDone) callbacks.onToolDone(block.name, result);
+  toolResults.push({ type: "tool_result", tool_use_id: block.id, content: typeof result === "string" ? result : JSON.stringify(result) });
 }
-return accumulated;
-} catch (e) {
-console.error("Stream error:", e);
-throw e;
+
+messages.push({ role: "user", content: toolResults });
+iterations++;
 }
+return fullText;
 }
 
 function buildSystemPrompt(profile) {
@@ -308,6 +539,57 @@ background: bg,
 {Icon && <Icon size={small ? 8 : 9} />}
 {children}
 </span>
+);
+}
+
+// ── Markdown Renderer ─────────────────────────────────
+function processInline(text) {
+const parts = [];
+let rem = text;
+let k = 0;
+const rx = /(\*\*(.+?)\*\*|`([^`]+)`)/;
+while (rem) {
+const m = rem.match(rx);
+if (!m) { parts.push(rem); break; }
+if (m.index > 0) parts.push(rem.slice(0, m.index));
+if (m[2]) parts.push(<strong key={k++} style={{ color: C.t1, fontWeight: 600 }}>{m[2]}</strong>);
+else if (m[3]) parts.push(<code key={k++} style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 4, fontSize: "0.9em" }}>{m[3]}</code>);
+rem = rem.slice(m.index + m[0].length);
+}
+return parts;
+}
+
+function MarkdownText({ text }) {
+if (!text) return null;
+const codeBlockRx = /(```[\s\S]*?```)/g;
+const segments = text.split(codeBlockRx);
+
+return (
+<div style={{ fontSize: 13, lineHeight: 1.72, color: C.t2 }}>
+  {segments.map((seg, si) => {
+    if (seg.startsWith("```")) {
+      const lines = seg.split("\n");
+      const lang = lines[0].replace("```", "").trim();
+      const code = lines.slice(1, lines[lines.length - 1] === "```" ? -1 : lines.length).join("\n").replace(/```$/, "");
+      return (
+        <pre key={si} style={{ background: "rgba(0,0,0,0.35)", padding: "10px 14px", borderRadius: 10, fontSize: 11, lineHeight: 1.55, overflowX: "auto", margin: "8px 0", fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", border: `1px solid ${C.b1}` }}>
+          {lang && <div style={{ fontSize: 9, color: C.t3, fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>{lang}</div>}
+          <code style={{ color: C.t2 }}>{code}</code>
+        </pre>
+      );
+    }
+    return seg.split("\n").map((line, li) => {
+      const key = `${si}-${li}`;
+      if (line.startsWith("### ")) return <div key={key} style={{ fontSize: 13, fontWeight: 700, color: C.t1, margin: "10px 0 3px" }}>{processInline(line.slice(4))}</div>;
+      if (line.startsWith("## ")) return <div key={key} style={{ fontSize: 14, fontWeight: 700, color: C.t1, margin: "12px 0 3px" }}>{processInline(line.slice(3))}</div>;
+      if (line.startsWith("# ")) return <div key={key} style={{ fontSize: 15, fontWeight: 700, color: C.t1, margin: "14px 0 4px" }}>{processInline(line.slice(2))}</div>;
+      if (/^[-*] /.test(line)) return <div key={key} style={{ paddingLeft: 10, display: "flex", gap: 6 }}><span style={{ color: C.t3, flexShrink: 0 }}>•</span><span>{processInline(line.slice(2))}</span></div>;
+      if (/^\d+\.\s/.test(line)) { const m = line.match(/^(\d+)\.\s(.+)/); return <div key={key} style={{ paddingLeft: 10, display: "flex", gap: 6 }}><span style={{ color: C.t3, flexShrink: 0 }}>{m[1]}.</span><span>{processInline(m[2])}</span></div>; }
+      if (!line.trim()) return <div key={key} style={{ height: 6 }} />;
+      return <div key={key}>{processInline(line)}</div>;
+    });
+  })}
+</div>
 );
 }
 
@@ -1184,7 +1466,7 @@ return (
     </div>
   </Section>
 
-  <Btn small danger onClick={async () => { await sSave("tr-profile", null); await sSave("tr-data", null); window.location.reload(); }}>
+  <Btn small danger onClick={async () => { await sSave("tr-profile", null); await sSave("tr-data", null); await sSave("tr-chat", null); window.location.reload(); }}>
     <Trash2 size={10} /> Reset Everything
   </Btn>
 </div>
@@ -1207,41 +1489,102 @@ return (
 );
 }
 
-// ── MODULE: Ask AI ─────────────────────────────────────
-function ModAsk({ profile, data, setProfile }) {
+// ── MODULE: Ask AI (Agentic) ──────────────────────────
+function ToolStep({ name, input, result, done }) {
+const TOOL_DISPLAY = {
+  search_workspace: { label: "Searching workspace", Icon: Search, color: C.te },
+  update_lead: { label: "Updating lead", Icon: Target, color: C.a },
+  update_deal: { label: "Updating deal", Icon: BarChart3, color: C.a },
+  add_lead: { label: "Adding lead", Icon: UserPlus, color: C.g },
+  add_deal: { label: "Adding deal", Icon: Plus, color: C.g },
+  log_activity: { label: "Logging", Icon: Activity, color: C.t3 },
+  modify_workspace: { label: "Modifying workspace", Icon: Settings, color: C.p },
+  web_search: { label: "Searching web", Icon: Globe, color: C.bl },
+};
+const meta = TOOL_DISPLAY[name] || { label: name, Icon: Plug, color: C.te };
+const [expanded, setExpanded] = useState(false);
+
+return (
+<div
+  onClick={() => done && setExpanded(!expanded)}
+  style={{ display: "flex", flexDirection: "column", gap: 4, padding: "6px 10px", borderRadius: 10, background: `${meta.color}08`, border: `1px solid ${meta.color}20`, cursor: done ? "pointer" : "default", transition: "all 0.15s" }}
+>
+  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+    {done
+      ? <CheckCircle size={11} color={meta.color} />
+      : <Loader size={11} color={meta.color} style={{ animation: "spin 1s linear infinite" }} />
+    }
+    <meta.Icon size={10} color={meta.color} />
+    <span style={{ fontSize: 10, color: meta.color, fontWeight: 600 }}>{meta.label}</span>
+    {input && !expanded && <span style={{ fontSize: 9, color: C.t3, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{typeof input === "string" ? input : JSON.stringify(input).slice(0, 60)}</span>}
+    {done && <ChevronDown size={9} color={C.t3} style={{ marginLeft: "auto", transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s" }} />}
+  </div>
+  {expanded && (
+    <div style={{ fontSize: 10, lineHeight: 1.5, padding: "4px 0 2px" }}>
+      {input && <div style={{ color: C.t3, marginBottom: 3 }}><strong style={{ color: C.t2 }}>Input:</strong> {typeof input === "string" ? input : JSON.stringify(input, null, 2)}</div>}
+      {result && <div style={{ color: C.t2 }}><strong style={{ color: C.t1 }}>Result:</strong> {typeof result === "string" ? (result.length > 200 ? result.slice(0, 200) + "…" : result) : JSON.stringify(result).slice(0, 200)}</div>}
+    </div>
+  )}
+</div>
+);
+}
+
+function ServerToolPill({ name }) {
+const meta = {
+  web_search: { label: "Searching web", Icon: Globe, color: C.bl },
+  gmail: { label: "Reading Gmail", Icon: Mail, color: C.r },
+  gcal: { label: "Checking Calendar", Icon: Calendar, color: C.bl },
+  calendar: { label: "Checking Calendar", Icon: Calendar, color: C.bl },
+};
+const m = meta[name] || meta[Object.keys(meta).find((k) => name.includes(k))] || { label: name, Icon: Plug, color: C.te };
+return (
+<div style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 20, background: `${m.color}10`, border: `1px solid ${m.color}22` }}>
+  <Loader size={9} color={m.color} style={{ animation: "spin 1s linear infinite" }} />
+  <m.Icon size={9} color={m.color} />
+  <span style={{ fontSize: 9, color: m.color, fontWeight: 600 }}>{m.label}…</span>
+</div>
+);
+}
+
+function ModAsk({ profile, data, setData, addActivity, setProfile }) {
 const systemPrompt = buildSystemPrompt(profile);
 const pipeline = data.pipeline || [];
 const leads = data.leads || [];
 const hotLeads = leads.filter((l) => l.status === "hot");
 const pipeTotal = pipeline.reduce((s, d) => s + d.value, 0);
 
-const [msgs, setMsgs] = useState([]);
+// Persisted conversation
+const [msgs, setMsgs, msgsReady] = usePersistedState("tr-chat", []);
 const [input, setInput] = useState("");
 const [streaming, setStreaming] = useState(false);
-const [activeTool, setActiveTool] = useState(null);
+const [serverTool, setServerTool] = useState(null);
 const scrollRef = useRef(null);
 const inputRef = useRef(null);
-const msgId = useRef(0);
+const msgId = useRef(Date.now());
+// Keep a ref to latest data for tool execution inside async closures
+const dataRef = useRef(data);
+dataRef.current = data;
 
 useEffect(() => {
-if (msgs.length === 0 && profile) {
+if (msgsReady && msgs.length === 0 && profile) {
   const ctx = pipeline.length > 0
-    ? `$${(pipeTotal / 1000).toFixed(0)}K in pipeline, ${leads.length} leads${hotLeads.length > 0 ? ` (${hotLeads.length} hot)` : ""}, Gmail, Calendar, and the web`
-    : "your Gmail, Calendar, and the web";
-  setMsgs([{ role: "assistant", text: `Hey ${profile.name} — I'm connected to ${ctx}. What do you need?`, id: 0 }]);
+    ? `$${(pipeTotal / 1000).toFixed(0)}K in pipeline, ${leads.length} leads${hotLeads.length > 0 ? ` (${hotLeads.length} hot)` : ""}`
+    : "your workspace";
+  setMsgs([{ role: "assistant", id: 0, blocks: [{ type: "text", text: `Hey ${profile.name} — I'm connected to ${ctx}, Gmail, Calendar, and the web. I can research, draft, update your pipeline, and take actions on your behalf. What do you need?` }] }]);
 }
-}, [profile?.name]);
+}, [msgsReady, profile?.name]);
 
 useEffect(() => {
 if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-}, [msgs, activeTool]);
+}, [msgs, serverTool]);
 
 const suggestions = [
-hotLeads.length > 0 && `Draft outreach to ${hotLeads[0].name}`,
-pipeline.length > 0 && "Summarize my pipeline",
+hotLeads.length > 0 && `Research ${hotLeads[0].name} and update their lead`,
+pipeline.length > 0 && "Analyze my pipeline and suggest next steps",
 "What's on my calendar today?",
 `Research ${profile.industry || "my industry"} trends`,
-"Catch me up on my emails",
+"Catch me up on unread emails",
+hotLeads.length > 1 && `Draft outreach to ${hotLeads[1].name} in my voice`,
 ].filter(Boolean).slice(0, 5);
 
 async function send(override) {
@@ -1253,75 +1596,128 @@ setStreaming(true);
 
 const uid = ++msgId.current;
 const aid = ++msgId.current;
-setMsgs((prev) => [...prev, { role: "user", text, id: uid }, { role: "assistant", text: "", id: aid, live: true }]);
+const asstMsg = { role: "assistant", id: aid, blocks: [], live: true };
 
-// Handle workspace commands locally first
-const lower = text.toLowerCase();
-const addMatch = Object.entries(ALL_MODULES).find(([, mod]) =>
-  lower.includes(`add ${mod.label.toLowerCase()}`) || lower.includes(`enable ${mod.label.toLowerCase()}`) || lower.includes(`turn on ${mod.label.toLowerCase()}`)
-);
-if (addMatch) {
-  const [id, mod] = addMatch;
-  if (!(profile.modules || []).includes(id)) {
-    setProfile((p) => ({ ...p, modules: [...(p.modules || []), id] }));
-    setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, text: `Done — ${mod.label} is now in your workspace. ${mod.desc}`, live: false } : m));
-    setStreaming(false);
-    return;
-  }
-}
-const removeMatch = Object.entries(ALL_MODULES).find(([, mod]) =>
-  lower.includes(`remove ${mod.label.toLowerCase()}`) || lower.includes(`turn off ${mod.label.toLowerCase()}`)
-);
-if (removeMatch && removeMatch[0] !== "command") {
-  const [id, mod] = removeMatch;
-  setProfile((p) => ({ ...p, modules: (p.modules || []).filter((m) => m !== id) }));
-  setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, text: `Removed ${mod.label} from your workspace. Add it back anytime from Settings.`, live: false } : m));
-  setStreaming(false);
-  return;
-}
+setMsgs((prev) => [...prev, { role: "user", id: uid, text }, asstMsg]);
 
-const pipeCtx = pipeline.slice(0, 5).map((d) => `${d.name}: $${(d.value / 1000).toFixed(0)}K (${d.stage})`).join(", ");
-const leadCtx = hotLeads.slice(0, 4).map((l) => l.name).join(", ");
-const ctx = [pipeCtx && `Pipeline: ${pipeCtx}`, leadCtx && `Hot leads: ${leadCtx}`].filter(Boolean).join("\n");
-const history = msgs.filter((m) => m.text && !m.live).slice(-10).map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
+// Build context for the AI
+const pipeCtx = pipeline.slice(0, 8).map((d) => `${d.name} (ID:${d.id}): $${(d.value / 1000).toFixed(0)}K, stage=${d.stage}, prob=${d.prob}%`).join("\n");
+const leadCtx = leads.slice(0, 8).map((l) => `${l.name} (ID:${l.id}): source=${l.source}, status=${l.status}, score=${l.score}, revenue=$${l.revenue}${l.email ? `, email=${l.email}` : ""}`).join("\n");
+const ctx = [pipeCtx && `PIPELINE:\n${pipeCtx}`, leadCtx && `LEADS:\n${leadCtx}`].filter(Boolean).join("\n\n");
+
+// Build conversation history from persisted messages (for multi-turn)
+const history = msgs.filter((m) => !m.live).slice(-12).map((m) => {
+  if (m.role === "user") return { role: "user", content: m.text || "" };
+  const text = (m.blocks || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  return { role: "assistant", content: text || "(action taken)" };
+});
+
+const allTools = [...LOCAL_TOOLS, TOOL_WEB];
 
 try {
-  await callAIStream(
-    [...history, { role: "user", content: ctx ? `WORKSPACE:\n${ctx}\n\n${text}` : text }],
-    { system: systemPrompt, tools: [TOOL_WEB], mcp: [MCP_GCAL, MCP_GMAIL] },
-    (chunk, tool) => {
-      setActiveTool(tool);
-      setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, text: chunk } : m)));
+  await runAgent(
+    [...history, { role: "user", content: ctx ? `MY WORKSPACE DATA:\n${ctx}\n\nREQUEST: ${text}` : text }],
+    { system: systemPrompt, tools: allTools, mcp: [MCP_GCAL, MCP_GMAIL], thinking: { type: "enabled", budget_tokens: 5000 } },
+    {
+      onText: (accum) => {
+        setServerTool(null);
+        setMsgs((prev) => prev.map((m) => {
+          if (m.id !== aid) return m;
+          // Find or create the last text block
+          const blocks = [...(m.blocks || [])];
+          const lastText = blocks.length > 0 && blocks[blocks.length - 1].type === "text" ? blocks.length - 1 : -1;
+          if (lastText >= 0) {
+            blocks[lastText] = { ...blocks[lastText], text: accum };
+          } else {
+            blocks.push({ type: "text", text: accum });
+          }
+          return { ...m, blocks };
+        }));
+      },
+      onServerTool: (name) => {
+        setServerTool(name);
+      },
+      onToolStart: (name, toolInput) => {
+        setServerTool(null);
+        setMsgs((prev) => prev.map((m) => {
+          if (m.id !== aid) return m;
+          const blocks = [...(m.blocks || [])];
+          blocks.push({ type: "tool", name, input: toolInput, result: null, done: false });
+          return { ...m, blocks };
+        }));
+      },
+      onToolDone: (name, result) => {
+        setMsgs((prev) => prev.map((m) => {
+          if (m.id !== aid) return m;
+          const blocks = [...(m.blocks || [])];
+          // Find the last tool block matching this name that isn't done
+          for (let i = blocks.length - 1; i >= 0; i--) {
+            if (blocks[i].type === "tool" && blocks[i].name === name && !blocks[i].done) {
+              blocks[i] = { ...blocks[i], result, done: true };
+              break;
+            }
+          }
+          return { ...m, blocks };
+        }));
+      },
+      executeTool: (name, toolInput) => {
+        return executeLocalTool(name, toolInput, dataRef.current, setData, addActivity, profile, setProfile);
+      },
     }
   );
-} catch {
-  setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, text: "Something went wrong — please try again." } : m)));
+} catch (e) {
+  console.error("Agent error:", e);
+  setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, blocks: [...(m.blocks || []), { type: "text", text: "\n\nSomething went wrong — please try again." }] } : m));
 }
 setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, live: false } : m)));
-setActiveTool(null);
+setServerTool(null);
 setStreaming(false);
 }
 
-const TOOL_META = {
-web:      { label: "Searching web",       Icon: Globe,     color: C.bl },
-gmail:    { label: "Reading Gmail",       Icon: Mail,      color: C.r  },
-calendar: { label: "Checking Calendar",   Icon: Calendar,  color: C.bl },
-tool:     { label: "Using tool",          Icon: Plug,      color: C.te },
-};
+// Render a single assistant message with interleaved blocks
+function renderBlocks(blocks, live) {
+if (!blocks || blocks.length === 0) {
+  if (live) return (
+    <div style={{ display: "flex", gap: 4, alignItems: "center", padding: "2px 0" }}>
+      {[0, 1, 2].map((i) => <div key={i} style={{ width: 5, height: 5, borderRadius: "50%", background: C.t3, animation: `pulse 1.2s ease ${i * 0.2}s infinite` }} />)}
+    </div>
+  );
+  return null;
+}
+return blocks.map((block, i) => {
+  if (block.type === "text" && block.text) {
+    return <MarkdownText key={i} text={block.text} />;
+  }
+  if (block.type === "tool") {
+    return <ToolStep key={i} name={block.name} input={block.input} result={block.result} done={block.done} />;
+  }
+  if (block.type === "thinking" && block.thinking) {
+    return (
+      <details key={i} style={{ marginBottom: 4 }}>
+        <summary style={{ fontSize: 10, color: C.t3, cursor: "pointer", fontFamily: FN, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+          <Sparkles size={9} color={C.t3} /> Reasoning
+        </summary>
+        <div style={{ fontSize: 10, color: C.t3, lineHeight: 1.5, padding: "6px 0 2px", whiteSpace: "pre-wrap", maxHeight: 150, overflowY: "auto" }}>{block.thinking}</div>
+      </details>
+    );
+  }
+  return null;
+});
+}
 
 return (
 <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 110px)" }}>
 
-  {/* Connection status bar */}
+  {/* Connection + context bar */}
   <div style={{ padding: "7px 14px 6px", display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap", borderBottom: `1px solid ${C.b1}`, flexShrink: 0 }}>
     {[
       { label: "Gmail",    color: C.r,  Icon: Mail     },
       { label: "Calendar", color: C.bl, Icon: Calendar },
       { label: "Web",      color: C.te, Icon: Globe    },
+      { label: "Tools",    color: C.p,  Icon: Zap      },
     ].map(({ label, color, Icon }) => (
       <div key={label} style={{ display: "flex", alignItems: "center", gap: 3, padding: "2px 8px", borderRadius: 20, background: `${color}12`, border: `1px solid ${color}25` }}>
         <div style={{ width: 5, height: 5, borderRadius: "50%", background: color }} />
-        <Icon size={9} color={color} />
         <span style={{ fontSize: 9, color, fontWeight: 600 }}>{label}</span>
       </div>
     ))}
@@ -1335,47 +1731,40 @@ return (
   </div>
 
   {/* Messages */}
-  <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 14 }}>
-    {msgs.map((m) => (
-      <div key={m.id} style={{ display: "flex", flexDirection: "column", alignItems: m.role === "user" ? "flex-end" : "flex-start" }}>
-        {m.role === "assistant" && (
+  <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 16 }}>
+    {msgs.map((m) => {
+      // User messages
+      if (m.role === "user") {
+        return (
+          <div key={m.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
+            <div style={{ maxWidth: "78%", padding: "10px 14px", borderRadius: "16px 16px 4px 16px", background: C.a, color: "#fff", fontSize: 13, lineHeight: 1.72, whiteSpace: "pre-wrap" }}>
+              {m.text}
+            </div>
+          </div>
+        );
+      }
+      // Assistant messages — block-based
+      return (
+        <div key={m.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5 }}>
             <div style={{ width: 20, height: 20, borderRadius: 6, background: C.aS, display: "flex", alignItems: "center", justifyContent: "center" }}>
               <Sparkles size={10} color={C.a} />
             </div>
             <span style={{ fontSize: 10, color: C.t3, fontWeight: 600 }}>Trellis AI</span>
+            {m.live && <Loader size={9} color={C.a} style={{ animation: "spin 1s linear infinite" }} />}
           </div>
-        )}
-        <div style={{
-          maxWidth: m.role === "user" ? "78%" : "100%",
-          padding: m.role === "user" ? "10px 14px" : "12px 16px",
-          borderRadius: m.role === "user" ? "16px 16px 4px 16px" : "4px 16px 16px 16px",
-          background: m.role === "user" ? C.a : C.s1,
-          border: m.role === "assistant" ? `1px solid ${C.b1}` : "none",
-          color: m.role === "user" ? "#fff" : C.t2,
-          fontSize: 13, lineHeight: 1.72, whiteSpace: "pre-wrap",
-        }}>
-          {m.text || (m.live && !activeTool && (
-            <div style={{ display: "flex", gap: 4, alignItems: "center", padding: "2px 0" }}>
-              {[0, 1, 2].map((i) => (
-                <div key={i} style={{ width: 5, height: 5, borderRadius: "50%", background: C.t3, animation: `pulse 1.2s ease ${i * 0.2}s infinite` }} />
-              ))}
-            </div>
-          ))}
+          <div style={{ maxWidth: "100%", padding: "12px 16px", borderRadius: "4px 16px 16px 16px", background: C.s1, border: `1px solid ${C.b1}`, display: "flex", flexDirection: "column", gap: 8 }}>
+            {renderBlocks(m.blocks, m.live)}
+          </div>
         </div>
-      </div>
-    ))}
+      );
+    })}
 
-    {/* Live tool indicator */}
-    {activeTool && TOOL_META[activeTool] && (
-      <div style={{ alignSelf: "flex-start", display: "flex", alignItems: "center", gap: 6, padding: "5px 11px", borderRadius: 20, background: `${TOOL_META[activeTool].color}12`, border: `1px solid ${TOOL_META[activeTool].color}25` }}>
-        <Loader size={10} color={TOOL_META[activeTool].color} style={{ animation: "spin 1s linear infinite" }} />
-        <span style={{ fontSize: 10, color: TOOL_META[activeTool].color, fontWeight: 600 }}>{TOOL_META[activeTool].label}...</span>
-      </div>
-    )}
+    {/* Server-side tool indicator */}
+    {serverTool && <ServerToolPill name={serverTool} />}
   </div>
 
-  {/* Suggested prompts — shown only before conversation starts */}
+  {/* Suggestions — only before conversation */}
   {msgs.length <= 1 && (
     <div style={{ padding: "6px 14px 4px", display: "flex", gap: 5, overflowX: "auto", flexShrink: 0 }}>
       {suggestions.map((s, i) => (
@@ -1384,13 +1773,12 @@ return (
           background: C.s1, border: `1px solid ${C.b1}`,
           color: C.t2, fontSize: 10, cursor: "pointer",
           fontFamily: FN, whiteSpace: "nowrap", flexShrink: 0,
-          transition: "background 0.15s",
         }}>{s}</button>
       ))}
     </div>
   )}
 
-  {/* Input */}
+  {/* Input + clear chat */}
   <div style={{ padding: "8px 14px 18px", borderTop: `1px solid ${C.b1}`, flexShrink: 0 }}>
     <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
       <textarea
@@ -1411,7 +1799,6 @@ return (
           color: C.t1, fontSize: 13, outline: "none",
           fontFamily: FN, resize: "none", lineHeight: 1.5,
           overflow: "hidden", opacity: streaming ? 0.6 : 1,
-          transition: "border-color 0.2s",
         }}
       />
       <button
@@ -1431,6 +1818,11 @@ return (
         }
       </button>
     </div>
+    {msgs.length > 1 && !streaming && (
+      <button onClick={() => setMsgs([])} style={{ background: "none", border: "none", color: C.t3, fontSize: 10, cursor: "pointer", fontFamily: FN, marginTop: 6, padding: 0 }}>
+        Clear conversation
+      </button>
+    )}
   </div>
 </div>
 );
@@ -1506,7 +1898,7 @@ const askMode = activeTab === "ask";
 
 function renderTab(tabId) {
 if (tabId === "settings") return <ModSettings profile={profile} setProfile={setProfile} />;
-if (tabId === "ask") return <ModAsk profile={profile} data={safeData} setProfile={setProfile} />;
+if (tabId === "ask") return <ModAsk profile={profile} data={safeData} setData={setData} addActivity={addActivity} setProfile={setProfile} />;
 const Renderer = MODULE_RENDERERS[tabId];
 if (Renderer) return <Renderer profile={profile} data={safeData} setData={setData} addActivity={addActivity} />;
 return <ModPlaceholder moduleId={tabId} />;
