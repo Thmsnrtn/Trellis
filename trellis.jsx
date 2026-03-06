@@ -359,18 +359,21 @@ return "";
 
 // ── Streaming Agentic Engine ──────────────────────────
 // Streams one API turn, returns { content: [...blocks], stopReason, text }
-async function streamOneTurn(messages, opts = {}, onText, onToolSignal) {
+async function streamOneTurn(messages, opts = {}, onText, onToolSignal, signal) {
 const body = { model: "claude-sonnet-4-20250514", max_tokens: 4096, messages, stream: true };
 if (opts.system) body.system = opts.system;
 if (opts.tools) body.tools = opts.tools;
 if (opts.mcp) body.mcp_servers = opts.mcp;
 if (opts.thinking) body.thinking = opts.thinking;
 
-const res = await fetch("https://api.anthropic.com/v1/messages", {
+const fetchOpts = {
 method: "POST",
 headers: { "Content-Type": "application/json" },
 body: JSON.stringify(body),
-});
+};
+if (signal) fetchOpts.signal = signal;
+
+const res = await fetch("https://api.anthropic.com/v1/messages", fetchOpts);
 
 if (!res.ok || !res.body) {
 const err = await res.json().catch(() => ({}));
@@ -382,7 +385,9 @@ const decoder = new TextDecoder();
 const contentBlocks = [];
 let idx = -1, curType = null, jsonBuf = "", textAccum = "", stopReason = "end_turn";
 
+try {
 while (true) {
+if (signal?.aborted) { reader.cancel(); break; }
 const { done, value } = await reader.read();
 if (done) break;
 for (const line of decoder.decode(value, { stream: true }).split("\n")) {
@@ -427,40 +432,58 @@ for (const line of decoder.decode(value, { stream: true }).split("\n")) {
   } catch {}
 }
 }
+} catch (e) {
+if (e.name === "AbortError") { stopReason = "abort"; }
+else throw e;
+}
 return { content: contentBlocks, stopReason, text: textAccum };
 }
 
 // Full agentic loop — streams text, executes local tools, loops until done
-async function runAgent(initialMessages, opts, callbacks) {
-// callbacks: { onText(accum), onToolStart(name, input), onToolDone(name, result), onServerTool(name), onError(err) }
+// callbacks: { onText(turnText), onNewTurn(), onToolStart(name, input), onToolDone(name, result), onServerTool(name), executeTool(name, input) }
+async function runAgent(initialMessages, opts, callbacks, signal) {
 let messages = [...initialMessages];
-let fullText = "";
 let iterations = 0;
 
 while (iterations < 8) {
+if (signal?.aborted) break;
+
+// Signal new turn so UI creates a fresh text block
+if (iterations > 0 && callbacks.onNewTurn) callbacks.onNewTurn();
+
 const turn = await streamOneTurn(
   messages, opts,
-  (text) => { fullText = text; if (callbacks.onText) callbacks.onText(text); },
+  (turnText) => { if (callbacks.onText) callbacks.onText(turnText); },
   (toolName, phase) => {
     if (phase === "start") {
-      // Check if it's a server-side tool (MCP/web) vs local
       const isServer = toolName === "web_search" || toolName.includes("gmail") || toolName.includes("gcal") || toolName.includes("calendar");
       if (isServer && callbacks.onServerTool) callbacks.onServerTool(toolName);
     }
-  }
+  },
+  signal
 );
+
+if (turn.stopReason === "abort") break;
 
 messages.push({ role: "assistant", content: turn.content });
 
 if (turn.stopReason !== "tool_use") break;
 
-// Execute local tools
+// Execute local tools sequentially, updating data between each
 const toolUseBlocks = turn.content.filter((b) => b.type === "tool_use");
 const toolResults = [];
 
 for (const block of toolUseBlocks) {
+  if (signal?.aborted) break;
   if (callbacks.onToolStart) callbacks.onToolStart(block.name, block.input);
-  const result = callbacks.executeTool(block.name, block.input);
+  // Small delay lets React state settle between tool executions
+  await new Promise((r) => setTimeout(r, 16));
+  let result;
+  try {
+    result = callbacks.executeTool(block.name, block.input);
+  } catch (e) {
+    result = `Error: ${e.message}`;
+  }
   if (callbacks.onToolDone) callbacks.onToolDone(block.name, result);
   toolResults.push({ type: "tool_result", tool_use_id: block.id, content: typeof result === "string" ? result : JSON.stringify(result) });
 }
@@ -468,7 +491,6 @@ for (const block of toolUseBlocks) {
 messages.push({ role: "user", content: toolResults });
 iterations++;
 }
-return fullText;
 }
 
 function buildSystemPrompt(profile) {
@@ -547,16 +569,58 @@ function processInline(text) {
 const parts = [];
 let rem = text;
 let k = 0;
-const rx = /(\*\*(.+?)\*\*|`([^`]+)`)/;
+// Match: **bold**, `code`, [text](url), ~~strike~~
+const rx = /(\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^)]+)\)|~~(.+?)~~)/;
 while (rem) {
 const m = rem.match(rx);
 if (!m) { parts.push(rem); break; }
 if (m.index > 0) parts.push(rem.slice(0, m.index));
 if (m[2]) parts.push(<strong key={k++} style={{ color: C.t1, fontWeight: 600 }}>{m[2]}</strong>);
 else if (m[3]) parts.push(<code key={k++} style={{ background: "rgba(255,255,255,0.06)", padding: "1px 5px", borderRadius: 4, fontSize: "0.9em" }}>{m[3]}</code>);
+else if (m[4] && m[5]) parts.push(<a key={k++} href={m[5]} target="_blank" rel="noopener noreferrer" style={{ color: C.a, textDecoration: "underline", textUnderlineOffset: 2 }}>{m[4]}</a>);
+else if (m[6]) parts.push(<span key={k++} style={{ textDecoration: "line-through", color: C.t3 }}>{m[6]}</span>);
 rem = rem.slice(m.index + m[0].length);
 }
 return parts;
+}
+
+function CodeBlock({ lang, code }) {
+const [cp, setCp] = useState(false);
+return (
+<div style={{ position: "relative", margin: "8px 0" }}>
+  <pre style={{ background: "rgba(0,0,0,0.35)", padding: "10px 14px", paddingRight: 40, borderRadius: 10, fontSize: 11, lineHeight: 1.55, overflowX: "auto", fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", border: `1px solid ${C.b1}`, margin: 0 }}>
+    {lang && <div style={{ fontSize: 9, color: C.t3, fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>{lang}</div>}
+    <code style={{ color: C.t2 }}>{code}</code>
+  </pre>
+  <button
+    onClick={() => { navigator.clipboard.writeText(code); setCp(true); setTimeout(() => setCp(false), 1500); }}
+    style={{ position: "absolute", top: 6, right: 6, padding: "3px 6px", borderRadius: 6, background: cp ? C.gS : "rgba(255,255,255,0.06)", border: `1px solid ${cp ? C.g + "40" : C.b1}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 3, fontSize: 9, color: cp ? C.g : C.t3, fontFamily: FN, transition: "all 0.15s" }}
+  >
+    {cp ? <CheckCircle size={8} /> : <Copy size={8} />} {cp ? "Copied" : "Copy"}
+  </button>
+</div>
+);
+}
+
+function MarkdownTable({ rows }) {
+if (!rows || rows.length < 2) return null;
+const headers = rows[0].split("|").map((c) => c.trim()).filter(Boolean);
+const dataRows = rows.slice(2).filter((r) => r.includes("|")); // skip separator row
+return (
+<div style={{ overflowX: "auto", margin: "8px 0", borderRadius: 8, border: `1px solid ${C.b1}` }}>
+  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+    <thead>
+      <tr>{headers.map((h, i) => <th key={i} style={{ padding: "6px 10px", textAlign: "left", fontWeight: 600, color: C.t1, borderBottom: `1px solid ${C.b1}`, background: "rgba(255,255,255,0.02)" }}>{h}</th>)}</tr>
+    </thead>
+    <tbody>
+      {dataRows.map((row, ri) => {
+        const cells = row.split("|").map((c) => c.trim()).filter(Boolean);
+        return <tr key={ri}>{cells.map((c, ci) => <td key={ci} style={{ padding: "5px 10px", color: C.t2, borderBottom: `1px solid ${C.b1}` }}>{processInline(c)}</td>)}</tr>;
+      })}
+    </tbody>
+  </table>
+</div>
+);
 }
 
 function MarkdownText({ text }) {
@@ -571,23 +635,46 @@ return (
       const lines = seg.split("\n");
       const lang = lines[0].replace("```", "").trim();
       const code = lines.slice(1, lines[lines.length - 1] === "```" ? -1 : lines.length).join("\n").replace(/```$/, "");
-      return (
-        <pre key={si} style={{ background: "rgba(0,0,0,0.35)", padding: "10px 14px", borderRadius: 10, fontSize: 11, lineHeight: 1.55, overflowX: "auto", margin: "8px 0", fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", border: `1px solid ${C.b1}` }}>
-          {lang && <div style={{ fontSize: 9, color: C.t3, fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>{lang}</div>}
-          <code style={{ color: C.t2 }}>{code}</code>
-        </pre>
-      );
+      return <CodeBlock key={si} lang={lang} code={code} />;
     }
-    return seg.split("\n").map((line, li) => {
-      const key = `${si}-${li}`;
+    // Detect tables (lines with |)
+    const allLines = seg.split("\n");
+    const rendered = [];
+    let tableBuffer = [];
+
+    const flushTable = () => {
+      if (tableBuffer.length >= 2) {
+        rendered.push(<MarkdownTable key={`t-${rendered.length}`} rows={tableBuffer} />);
+      } else {
+        tableBuffer.forEach((line) => rendered.push(renderLine(line, `${si}-fb-${rendered.length}`)));
+      }
+      tableBuffer = [];
+    };
+
+    const renderLine = (line, key) => {
       if (line.startsWith("### ")) return <div key={key} style={{ fontSize: 13, fontWeight: 700, color: C.t1, margin: "10px 0 3px" }}>{processInline(line.slice(4))}</div>;
       if (line.startsWith("## ")) return <div key={key} style={{ fontSize: 14, fontWeight: 700, color: C.t1, margin: "12px 0 3px" }}>{processInline(line.slice(3))}</div>;
       if (line.startsWith("# ")) return <div key={key} style={{ fontSize: 15, fontWeight: 700, color: C.t1, margin: "14px 0 4px" }}>{processInline(line.slice(2))}</div>;
+      if (/^> /.test(line)) return <div key={key} style={{ paddingLeft: 12, borderLeft: `2px solid ${C.a}40`, color: C.t2, margin: "4px 0" }}>{processInline(line.slice(2))}</div>;
       if (/^[-*] /.test(line)) return <div key={key} style={{ paddingLeft: 10, display: "flex", gap: 6 }}><span style={{ color: C.t3, flexShrink: 0 }}>•</span><span>{processInline(line.slice(2))}</span></div>;
-      if (/^\d+\.\s/.test(line)) { const m = line.match(/^(\d+)\.\s(.+)/); return <div key={key} style={{ paddingLeft: 10, display: "flex", gap: 6 }}><span style={{ color: C.t3, flexShrink: 0 }}>{m[1]}.</span><span>{processInline(m[2])}</span></div>; }
+      if (/^\d+\.\s/.test(line)) { const m = line.match(/^(\d+)\.\s(.+)/); return m ? <div key={key} style={{ paddingLeft: 10, display: "flex", gap: 6 }}><span style={{ color: C.t3, flexShrink: 0 }}>{m[1]}.</span><span>{processInline(m[2])}</span></div> : <div key={key}>{line}</div>; }
+      if (/^---+$|^\*\*\*+$|^___+$/.test(line.trim())) return <hr key={key} style={{ border: "none", borderTop: `1px solid ${C.b1}`, margin: "10px 0" }} />;
       if (!line.trim()) return <div key={key} style={{ height: 6 }} />;
       return <div key={key}>{processInline(line)}</div>;
+    };
+
+    allLines.forEach((line, li) => {
+      const isTableRow = line.includes("|") && (line.trim().startsWith("|") || /\|.*\|/.test(line));
+      if (isTableRow) {
+        tableBuffer.push(line);
+      } else {
+        if (tableBuffer.length > 0) flushTable();
+        rendered.push(renderLine(line, `${si}-${li}`));
+      }
     });
+    if (tableBuffer.length > 0) flushTable();
+
+    return <span key={si}>{rendered}</span>;
   })}
 </div>
 );
@@ -1553,14 +1640,24 @@ const leads = data.leads || [];
 const hotLeads = leads.filter((l) => l.status === "hot");
 const pipeTotal = pipeline.reduce((s, d) => s + d.value, 0);
 
-// Persisted conversation
-const [msgs, setMsgs, msgsReady] = usePersistedState("tr-chat", []);
+// Persisted conversation (pruned to last 50 messages)
+const [rawMsgs, setRawMsgs, msgsReady] = usePersistedState("tr-chat", []);
+const msgs = rawMsgs || [];
+const setMsgs = useCallback((fn) => {
+setRawMsgs((prev) => {
+  const next = typeof fn === "function" ? fn(prev || []) : fn;
+  // Prune to 50 messages to prevent unbounded growth
+  return next.length > 50 ? next.slice(next.length - 50) : next;
+});
+}, [setRawMsgs]);
 const [input, setInput] = useState("");
 const [streaming, setStreaming] = useState(false);
 const [serverTool, setServerTool] = useState(null);
+const [copied, setCopied] = useState(null); // message id that was just copied
 const scrollRef = useRef(null);
 const inputRef = useRef(null);
 const msgId = useRef(Date.now());
+const abortRef = useRef(null); // AbortController for stop generation
 // Keep a ref to latest data for tool execution inside async closures
 const dataRef = useRef(data);
 dataRef.current = data;
@@ -1605,31 +1702,58 @@ const pipeCtx = pipeline.slice(0, 8).map((d) => `${d.name} (ID:${d.id}): $${(d.v
 const leadCtx = leads.slice(0, 8).map((l) => `${l.name} (ID:${l.id}): source=${l.source}, status=${l.status}, score=${l.score}, revenue=$${l.revenue}${l.email ? `, email=${l.email}` : ""}`).join("\n");
 const ctx = [pipeCtx && `PIPELINE:\n${pipeCtx}`, leadCtx && `LEADS:\n${leadCtx}`].filter(Boolean).join("\n\n");
 
-// Build conversation history from persisted messages (for multi-turn)
-const history = msgs.filter((m) => !m.live).slice(-12).map((m) => {
-  if (m.role === "user") return { role: "user", content: m.text || "" };
-  const text = (m.blocks || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return { role: "assistant", content: text || "(action taken)" };
+// Build conversation history preserving tool context
+const history = msgs.filter((m) => !m.live).slice(-12).flatMap((m) => {
+  if (m.role === "user") return [{ role: "user", content: m.text || "" }];
+  // Reconstruct assistant content blocks for full context
+  const content = [];
+  for (const b of (m.blocks || [])) {
+    if (b.type === "text" && b.text) content.push({ type: "text", text: b.text });
+    if (b.type === "tool" && b.done) {
+      content.push({ type: "tool_use", id: `hist_${b.name}`, name: b.name, input: b.input || {} });
+    }
+  }
+  if (content.length === 0) content.push({ type: "text", text: "(action taken)" });
+  const result = [{ role: "assistant", content }];
+  // Add tool results as a follow-up user message if there were tool calls
+  const toolBlocks = (m.blocks || []).filter((b) => b.type === "tool" && b.done);
+  if (toolBlocks.length > 0) {
+    result.push({ role: "user", content: toolBlocks.map((b) => ({ type: "tool_result", tool_use_id: `hist_${b.name}`, content: typeof b.result === "string" ? b.result : JSON.stringify(b.result || "") })) });
+  }
+  return result;
 });
 
 const allTools = [...LOCAL_TOOLS, TOOL_WEB];
+
+// Track which text block index we're writing to per turn
+let currentTextIdx = -1;
+
+// AbortController for stop generation
+const controller = new AbortController();
+abortRef.current = controller;
 
 try {
   await runAgent(
     [...history, { role: "user", content: ctx ? `MY WORKSPACE DATA:\n${ctx}\n\nREQUEST: ${text}` : text }],
     { system: systemPrompt, tools: allTools, mcp: [MCP_GCAL, MCP_GMAIL], thinking: { type: "enabled", budget_tokens: 5000 } },
     {
-      onText: (accum) => {
+      onNewTurn: () => {
+        // New agent turn after tool execution — force a new text block
+        currentTextIdx = -1;
+      },
+      onText: (turnText) => {
         setServerTool(null);
         setMsgs((prev) => prev.map((m) => {
           if (m.id !== aid) return m;
-          // Find or create the last text block
           const blocks = [...(m.blocks || [])];
-          const lastText = blocks.length > 0 && blocks[blocks.length - 1].type === "text" ? blocks.length - 1 : -1;
-          if (lastText >= 0) {
-            blocks[lastText] = { ...blocks[lastText], text: accum };
+          // Find the last text block or create one for this turn
+          const lastIdx = blocks.length - 1;
+          if (lastIdx >= 0 && blocks[lastIdx].type === "text" && currentTextIdx === lastIdx) {
+            blocks[lastIdx] = { ...blocks[lastIdx], text: turnText };
           } else {
-            blocks.push({ type: "text", text: accum });
+            // New text block for this turn
+            blocks.push({ type: "text", text: turnText });
+            currentTextIdx = blocks.length - 1;
           }
           return { ...m, blocks };
         }));
@@ -1639,6 +1763,7 @@ try {
       },
       onToolStart: (name, toolInput) => {
         setServerTool(null);
+        currentTextIdx = -1; // Force new text block after tool
         setMsgs((prev) => prev.map((m) => {
           if (m.id !== aid) return m;
           const blocks = [...(m.blocks || [])];
@@ -1650,7 +1775,6 @@ try {
         setMsgs((prev) => prev.map((m) => {
           if (m.id !== aid) return m;
           const blocks = [...(m.blocks || [])];
-          // Find the last tool block matching this name that isn't done
           for (let i = blocks.length - 1; i >= 0; i--) {
             if (blocks[i].type === "tool" && blocks[i].name === name && !blocks[i].done) {
               blocks[i] = { ...blocks[i], result, done: true };
@@ -1663,12 +1787,16 @@ try {
       executeTool: (name, toolInput) => {
         return executeLocalTool(name, toolInput, dataRef.current, setData, addActivity, profile, setProfile);
       },
-    }
+    },
+    controller.signal
   );
 } catch (e) {
-  console.error("Agent error:", e);
-  setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, blocks: [...(m.blocks || []), { type: "text", text: "\n\nSomething went wrong — please try again." }] } : m));
+  if (e.name !== "AbortError") {
+    console.error("Agent error:", e);
+    setMsgs((prev) => prev.map((m) => m.id === aid ? { ...m, blocks: [...(m.blocks || []), { type: "text", text: "\n\nSomething went wrong — please try again." }] } : m));
+  }
 }
+abortRef.current = null;
 setMsgs((prev) => prev.map((m) => (m.id === aid ? { ...m, live: false } : m)));
 setServerTool(null);
 setStreaming(false);
@@ -1743,7 +1871,9 @@ return (
           </div>
         );
       }
-      // Assistant messages — block-based
+      // Assistant messages — block-based with action buttons
+      const fullText = (m.blocks || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      const isLast = m.id === msgs[msgs.length - 1]?.id;
       return (
         <div key={m.id} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5 }}>
@@ -1756,6 +1886,21 @@ return (
           <div style={{ maxWidth: "100%", padding: "12px 16px", borderRadius: "4px 16px 16px 16px", background: C.s1, border: `1px solid ${C.b1}`, display: "flex", flexDirection: "column", gap: 8 }}>
             {renderBlocks(m.blocks, m.live)}
           </div>
+          {/* Action buttons — copy + regenerate */}
+          {!m.live && fullText && (
+            <div style={{ display: "flex", gap: 3, marginTop: 4 }}>
+              <button onClick={() => { navigator.clipboard.writeText(fullText); setCopied(m.id); setTimeout(() => setCopied(null), 2000); }}
+                style={{ display: "flex", alignItems: "center", gap: 3, padding: "3px 8px", borderRadius: 8, background: "transparent", border: "none", cursor: "pointer", fontFamily: FN, fontSize: 10, color: copied === m.id ? C.g : C.t3, transition: "color 0.15s" }}>
+                {copied === m.id ? <CheckCircle size={10} /> : <Copy size={10} />} {copied === m.id ? "Copied" : "Copy"}
+              </button>
+              {isLast && !streaming && (
+                <button onClick={() => { setMsgs((prev) => prev.slice(0, -1)); const lastUserMsg = msgs.findLast((x) => x.role === "user"); if (lastUserMsg) send(lastUserMsg.text); }}
+                  style={{ display: "flex", alignItems: "center", gap: 3, padding: "3px 8px", borderRadius: 8, background: "transparent", border: "none", cursor: "pointer", fontFamily: FN, fontSize: 10, color: C.t3 }}>
+                  <RefreshCw size={10} /> Regenerate
+                </button>
+              )}
+            </div>
+          )}
         </div>
       );
     })}
@@ -1801,22 +1946,33 @@ return (
           overflow: "hidden", opacity: streaming ? 0.6 : 1,
         }}
       />
-      <button
-        onClick={() => send()}
-        disabled={streaming || !input.trim()}
-        style={{
-          width: 42, height: 42, borderRadius: 12, flexShrink: 0,
-          background: streaming || !input.trim() ? C.s2 : C.a,
-          border: "none", cursor: streaming || !input.trim() ? "default" : "pointer",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          opacity: streaming || !input.trim() ? 0.4 : 1, transition: "all 0.2s",
-        }}
-      >
-        {streaming
-          ? <Loader size={15} color={C.t3} style={{ animation: "spin 1s linear infinite" }} />
-          : <ArrowUpRight size={16} color={!input.trim() ? C.t3 : "#fff"} />
-        }
-      </button>
+      {streaming ? (
+        <button
+          onClick={() => { if (abortRef.current) abortRef.current.abort(); }}
+          style={{
+            width: 42, height: 42, borderRadius: 12, flexShrink: 0,
+            background: C.rS, border: `1px solid ${C.r}40`,
+            cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "all 0.2s",
+          }}
+        >
+          <div style={{ width: 12, height: 12, borderRadius: 2, background: C.r }} />
+        </button>
+      ) : (
+        <button
+          onClick={() => send()}
+          disabled={!input.trim()}
+          style={{
+            width: 42, height: 42, borderRadius: 12, flexShrink: 0,
+            background: !input.trim() ? C.s2 : C.a,
+            border: "none", cursor: !input.trim() ? "default" : "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            opacity: !input.trim() ? 0.4 : 1, transition: "all 0.2s",
+          }}
+        >
+          <ArrowUpRight size={16} color={!input.trim() ? C.t3 : "#fff"} />
+        </button>
+      )}
     </div>
     {msgs.length > 1 && !streaming && (
       <button onClick={() => setMsgs([])} style={{ background: "none", border: "none", color: C.t3, fontSize: 10, cursor: "pointer", fontFamily: FN, marginTop: 6, padding: 0 }}>
